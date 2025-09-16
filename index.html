@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>사전신청 추첨 v14 (안정화 · 이름표시 · 중복방지)</title>
+  <style>
+    :root{--bg:#f7f8fb;--card:#fff;--txt:#111827;--muted:#6b7280;--pri:#4f46e5;--ok:#16a34a;--bad:#e11d48;--border:#e5e7eb}
+    *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif;background:var(--bg);color:var(--txt)}
+    .wrap{max-width:1120px;margin:0 auto;padding:16px}
+    .top{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--border);z-index:10}
+    .row{display:flex;gap:8px;align-items:center}
+    .grow{flex:1}
+    .title{font-weight:800}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+    .btn{border:0;border-radius:12px;padding:10px 14px;background:#f3f4f6;cursor:pointer}
+    .btn:hover{background:#e5e7eb}
+    .btn.pri{background:var(--pri);color:#fff}
+    .btn.danger{background:#fee2e2;color:#991b1b}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+    .grid{display:grid;gap:16px}
+    .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+    .muted{color:var(--muted)}
+    .input{width:100%;padding:10px;border:1px solid var(--border);border-radius:12px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-top:1px solid var(--border);text-align:left}
+    .big{font-size:42px;font-weight:900;letter-spacing:4px}
+    .center{text-align:center}
+    /* 발표화면: 요청대로 흰 배경 */
+    .display{background:#fff;color:var(--txt);border-radius:16px;min-height:70vh;padding:16px;border:1px solid var(--border)}
+    .display .box{background:#fff;border:1px solid var(--border);border-radius:16px;padding:12px}
+    .rank{color:var(--muted)}
+    .waiting{color:#9ca3af;font-size:24px}
+    .name{font-size:18px;font-weight:700;margin-top:6px}
+    .small{font-size:12px}
+    .alert{background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d;border-radius:12px;padding:10px;margin:8px 0;display:none}
+    @media (max-width:900px){.g2{grid-template-columns:1fr}.g3{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="wrap row">
+      <div class="title">사전신청 추첨</div>
+      <div class="muted small">event: <span id="topEventId" class="mono"></span> <span class="muted">·</span> <span class="mono" id="shareLinkSmall"></span></div>
+      <span class="muted small" style="margin-left:8px">v14</span>
+      <div class="grow"></div>
+      <div id="tabs" class="row"></div>
+      <button class="btn" id="btnNew">새 이벤트</button>
+      <button class="btn" id="btnClearHash">주소 해시 지우기</button>
+    </div>
+  </div>
+
+  <div class="wrap" id="boot"></div>
+  <div class="wrap" id="page" style="display:none">
+    <div id="globalError" class="alert"></div>
+    <div class="grid g2" id="admin"></div>
+    <div id="participant"></div>
+    <div id="display"></div>
+  </div>
+
+  <script>
+  'use strict';
+
+  // ===== 유틸 =====
+  const $ = (sel, root=document) => root.querySelector(sel);
+  const key = (eventId, suffix) => `raffle:${eventId}:${suffix}`;
+  const normId = (s)=>{ s=(s||'').toString(); let out=''; for(let i=0;i<s.length;i++){ const ch=s[i]; if(ch===' '||ch==='\\t'||ch==='\\n'||ch==='\\r'||ch==='-'||ch==='_') continue; out+=ch; } return out.toUpperCase(); };
+  const ensureArr = (v)=> Array.isArray(v)? v : (v? [v] : []);
+
+  function escapeHtml(s){return String(s).replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
+  function download(filename, text){ const blob=new Blob([text],{type:'text/plain;charset=utf-8;'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url); }
+  function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]] } }
+  function prizeForRank(rank){ return rank===1?state.prizes.rank1:rank===2?state.prizes.rank2:rank===3?state.prizes.rank3:state.prizes.rest }
+  function rankPrizeList(){ return [state.prizes.rank1,state.prizes.rank2,state.prizes.rank3, ...Array(7).fill(state.prizes.rest)]; }
+
+  // ===== 상태 =====
+  const state = {
+    eventId:'',
+    tab:'admin',
+    registrants:[], // {empId,name}
+    checkins:[],    // {empId,name,code,at}
+    prizes:{rank1:'1등 상품',rank2:'2등 상품',rank3:'3등 상품',rest:'참가상(4~10등)'},
+    winners:[]      // {rank,empId,name,code,at,prize}
+  };
+
+  // localStorage 사용 가능 여부
+  let STORAGE_OK = true;
+  try { localStorage.setItem('raffle:__probe','1'); localStorage.removeItem('raffle:__probe'); }
+  catch(e){ STORAGE_OK=false; showError('브라우저 저장소(localStorage)를 사용할 수 없습니다. 일반 창에서 다시 시도하세요.'); }
+
+  function showError(msg){ const g=$('#globalError'); if(!g) return; g.style.display='block'; g.textContent = msg; }
+
+  // ===== 저장/로드 + 치유 =====
+  function saveAll(){
+    if(!state.eventId) return true;
+    try{
+      localStorage.setItem(key(state.eventId,'registrants'), JSON.stringify(state.registrants));
+      localStorage.setItem(key(state.eventId,'checkins'), JSON.stringify(state.checkins));
+      localStorage.setItem(key(state.eventId,'prizes'), JSON.stringify(state.prizes));
+      localStorage.setItem(key(state.eventId,'winners'), JSON.stringify(state.winners));
+      return true;
+    }catch(e){
+      STORAGE_OK=false; showError('저장 실패: ' + (e?.message||'localStorage 오류') + ' — 화면은 계속 사용 가능합니다.');
+      return false;
+    }
+  }
+  function loadAll(){
+    try{ state.registrants = healRegistrants(JSON.parse(localStorage.getItem(key(state.eventId,'registrants'))||'[]')); }catch{ state.registrants=[]; }
+    try{ state.checkins = healCheckins(JSON.parse(localStorage.getItem(key(state.eventId,'checkins'))||'[]')); }catch{ state.checkins=[]; }
+    try{ state.prizes = JSON.parse(localStorage.getItem(key(state.eventId,'prizes'))||'null') || state.prizes; }catch{}
+    try{ state.winners = healWinners(JSON.parse(localStorage.getItem(key(state.eventId,'winners'))||'[]')); }catch{ state.winners=[]; }
+  }
+
+  function healRegistrants(arr){
+    const out=[]; const seen=new Set();
+    for(const r of ensureArr(arr)){
+      if(!r || typeof r!=='object') continue;
+      const empId = String(r.empId||'').trim(); const name = String(r.name||'').trim();
+      const k = normId(empId); if(!k || seen.has(k)) continue; seen.add(k);
+      out.push({empId,name});
+    }
+    return out;
+  }
+  function healCheckins(arr){
+    // 동일 사번 중복 → 가장 이른 at 1건만 유지. 잘못된 항목 제거. code 4자리 보정.
+    const map=new Map();
+    for(const c of ensureArr(arr)){
+      if(!c || typeof c!=='object') continue;
+      const k = normId(c.empId||''); if(!k) continue;
+      const entry = { empId:String(c.empId||''), name:String(c.name||''), code:String(c.code||'').padStart(4,'0'), at:Number(c.at)||Date.now() };
+      const cur = map.get(k);
+      if(!cur || entry.at < cur.at) map.set(k, entry);
+    }
+    return Array.from(map.values());
+  }
+  function healWinners(arr){
+    // 유효 항목만, 사번 중복 제거, 1~10등으로 재정렬·재번호
+    const temp=[];
+    for(const w of ensureArr(arr)){
+      if(!w || typeof w!=='object') continue;
+      const k = normId(w.empId||''); if(!k) continue;
+      const code = String(w.code||'').padStart(4,'0');
+      temp.push({rank:Number(w.rank)||0, empId:String(w.empId||''), name:String(w.name||''), code, at:Number(w.at)||Date.now(), prize:String(w.prize||'')});
+    }
+    // 사번 중복 제거(가장 앞선 rank 유지)
+    temp.sort((a,b)=>a.rank-b.rank||a.at-b.at);
+    const seen = new Set(); const out=[];
+    for(const w of temp){ const k=normId(w.empId); if(seen.has(k)) continue; seen.add(k); out.push(w); if(out.length>=10) break; }
+    // 랭크 재부여 + prize 재계산
+    out.forEach((w,i)=>{ w.rank=i+1; w.prize = prizeForRank(w.rank); });
+    return out;
+  }
+
+  // ===== 부트스트랩 =====
+  function showBootstrap(){
+    const boot = $('#boot');
+    $('#page').style.display='none';
+    boot.innerHTML = `
+      <div class="card" style="max-width:560px;margin:40px auto;">
+        <h2 style="margin:0 0 8px 0;font-size:22px;font-weight:800">이벤트 만들기</h2>
+        <p class="muted small">예: <span class="mono">ai-training-2025-09</span>. 같은 이벤트ID는 같은 저장공간을 씁니다.</p>
+        <div class="row" style="margin-top:8px">
+          <input class="input mono grow" id="eventName" placeholder="이벤트ID 입력" />
+          <button class="btn pri" id="create">이벤트 생성</button>
+        </div>
+      </div>`;
+    $('#create').onclick = ()=>{
+      const name = $('#eventName').value.trim();
+      if(!name) return alert('이벤트ID를 입력하세요.');
+      state.eventId = name;
+      const p = new URLSearchParams(location.hash.replace('#',''));
+      p.set('event', name); p.set('tab','admin');
+      location.hash = p.toString();
+      boot.innerHTML='';
+      loadAll();
+      renderAll();
+    };
+  }
+
+  // ===== 탑바 =====
+  function renderTop(){
+    $('#topEventId').textContent = state.eventId || '-';
+    const tabs = [['admin','참여자/추첨(진행자)'], ['participant','참가자'], ['display','발표 화면']];
+    const el = $('#tabs'); el.innerHTML='';
+    tabs.forEach(([id,label])=>{
+      const b=document.createElement('button'); b.className='btn';
+      if(state.tab===id){ b.style.background='var(--pri)'; b.style.color='#fff'; }
+      b.textContent=label; b.onclick=()=>{
+        state.tab=id;
+        const p = new URLSearchParams(location.hash.replace('#','')); p.set('event',state.eventId); p.set('tab',state.tab); location.hash=p.toString();
+        renderAll();
+      };
+      el.appendChild(b);
+    });
+    $('#btnNew').onclick=()=>{ if(!confirm('현재 이벤트에서 나가고 새 이벤트로 이동합니다. (데이터는 보존)')) return; state.eventId=''; location.hash=''; showBootstrap(); };
+    $('#btnClearHash').onclick=()=>{ history.replaceState(null,'',location.pathname+location.search); state.eventId=''; showBootstrap(); };
+    // 공유 링크 미리 보기
+    const link = state.eventId ? `${location.origin}${location.pathname}#event=${encodeURIComponent(state.eventId)}&tab=participant` : '';
+    $('#shareLinkSmall').textContent = state.eventId? link : '';
+  }
+
+  // ===== 어드민 =====
+  function renderAdmin(){
+    const root = $('#admin');
+    if(state.tab!=='admin'){ root.innerHTML=''; return; }
+    $('#page').style.display='block';
+    $('#globalError').style.display = STORAGE_OK? 'none' : 'block';
+    root.className='grid g2';
+
+    const c1 = document.createElement('div'); c1.className='card'; c1.innerHTML=`
+      <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:800">사전신청자 명단</h3>
+      <p class="muted small">CSV 업로드 (열: <span class="mono">empId,name</span> 또는 <span class="mono">사번,이름</span>)</p>
+      <div class="row" style="gap:8px;margin:8px 0 12px 0">
+        <input type="file" id="csvFile" accept=".csv" />
+        <button class="btn" id="sample">샘플 CSV</button>
+        <button class="btn" id="clearReg">명단 비우기</button>
+      </div>
+      <div style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:12px;padding:8px" id="regTable"></div>`;
+    const c2 = document.createElement('div'); c2.className='card'; c2.innerHTML=`
+      <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:800">참여자 체크인 (실시간)</h3>
+      <p class="muted small">사번을 입력하면 사전신청 확인 후 4자리 참여번호가 발급됩니다. (중복 자동 방지)</p>
+      <div class="row" style="gap:8px;margin-bottom:8px">
+        <span class="badge">사전신청자 수: <b id="cntReg">0</b></span>
+        <span class="badge" style="background:#ecfdf5;color:#065f46">체크인 수: <b id="cntCheck">0</b></span>
+        <span class="badge" style="background:#e0f2fe;color:#075985">당첨 수: <b id="cntWin">0</b></span>
+      </div>
+      <div style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:12px;padding:8px" id="checkTable"></div>
+      <div class="muted small" style="margin-top:8px">
+        참가자 링크: <span class="mono" id="shareLink"></span>
+        <button class="btn" id="copyLink">링크 복사</button>
+      </div>`;
+    const c3 = document.createElement('div'); c3.className='card'; c3.innerHTML=`
+      <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:800">상품 설정</h3>
+      <div class="grid g3" style="gap:12px">
+        <div><div class="muted small">1등 상품</div><input class="input" id="p1" /></div>
+        <div><div class="muted small">2등 상품</div><input class="input" id="p2" /></div>
+        <div><div class="muted small">3등 상품</div><input class="input" id="p3" /></div>
+        <div class="g3" style="grid-column:1/-1"><div class="muted small">4~10등 공통 상품</div><input class="input" id="prest" /></div>
+      </div>
+      <div class="row" style="gap:8px;margin-top:10px"><button class="btn pri" id="savePrize">저장</button><button class="btn" id="resetPrize">기본값</button></div>`;
+    const c4 = document.createElement('div'); c4.className='card'; c4.innerHTML=`
+      <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:800">추첨</h3>
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <button class="btn pri" id="drawBtn">추첨 시작</button>
+        <button class="btn" id="openDisplay">발표 화면 새창</button>
+        <button class="btn" id="exportCsv">당첨결과 CSV</button>
+        <button class="btn" id="resetW">결과 초기화</button>
+        <div class="grow"></div>
+        <button class="btn danger" id="clearAll">전체 삭제</button>
+      </div>
+      <div class="grid g2" id="winners"></div>`;
+
+    root.innerHTML=''; root.append(c1,c2,c3,c4);
+
+    // 업로드
+    $('#csvFile').onchange = (e)=>{
+      const f = e.target.files && e.target.files[0]; if(!f) return;
+      const reader = new FileReader();
+      reader.onload = ()=>{
+        const txt = String(reader.result||'').replace(/^\uFEFF/,'');
+        const rows = parseCSV(txt);
+        state.registrants = healRegistrants(rows);
+        saveAll(); renderAdmin();
+      };
+      reader.readAsText(f,'utf-8');
+    };
+    $('#sample').onclick = ()=>{ const sample='empId,name\nA12345,홍길동\nB99101,김사원\nC88888,이리더\n'; download('registrants-sample.csv', sample); };
+    $('#clearReg').onclick = ()=>{ if(confirm('사전신청자 명단을 비울까요?')){ state.registrants=[]; saveAll(); renderAdmin(); } };
+
+    // 카운트 & 테이블
+    $('#cntReg').textContent = state.registrants.length;
+    $('#cntCheck').textContent = state.checkins.length;
+    $('#cntWin').textContent = state.winners.length;
+    $('#regTable').innerHTML = renderTable(['사번','이름'], state.registrants.map(r=>[r.empId, r.name||'']));
+    const checkRows = [...state.checkins].sort((a,b)=>a.at-b.at).map(c=>[c.code, c.empId, c.name||'', new Date(c.at).toLocaleString()]);
+    $('#checkTable').innerHTML = renderTable(['참여번호','사번','이름','체크인 시각'], checkRows);
+
+    // 참가자 링크
+    const link = state.eventId ? `${location.origin}${location.pathname}#event=${encodeURIComponent(state.eventId)}&tab=participant` : '';
+    $('#shareLink').textContent = link;
+    if(navigator.clipboard){ $('#copyLink').onclick = ()=> navigator.clipboard.writeText(link).then(()=>alert('링크가 복사되었습니다.')); }
+
+    // 상품
+    $('#p1').value = state.prizes.rank1; $('#p2').value = state.prizes.rank2; $('#p3').value = state.prizes.rank3; $('#prest').value = state.prizes.rest;
+    $('#savePrize').onclick = ()=>{ state.prizes={rank1:$('#p1').value,rank2:$('#p2').value,rank3:$('#p3').value,rest:$('#prest').value}; const ok=saveAll(); if(!ok) alert('저장 실패 — 화면은 계속 사용 가능합니다.'); };
+    $('#resetPrize').onclick = ()=>{ state.prizes={rank1:'1등 상품',rank2:'2등 상품',rank3:'3등 상품',rest:'참가상(4~10등)'}; saveAll(); renderAdmin(); };
+
+    // 추첨/초기화
+    $('#drawBtn').onclick = startDraw;
+    $('#openDisplay').onclick = ()=> window.open(`#event=${encodeURIComponent(state.eventId)}&tab=display`, '_blank');
+    $('#exportCsv').onclick = exportWinnersCSV;
+    $('#resetW').onclick = ()=>{ if(!confirm('당첨 결과를 초기화할까요?')) return; state.winners=[]; const ok=saveAll(); renderAdmin(); renderDisplay(); if(!ok) alert('저장 실패 — 화면만 초기화되었습니다.'); };
+    $('#clearAll').onclick = ()=>{
+      if(!confirm('이 이벤트의 모든 데이터를 삭제할까요?')) return;
+      try{
+        localStorage.removeItem(key(state.eventId,'registrants'));
+        localStorage.removeItem(key(state.eventId,'checkins'));
+        localStorage.removeItem(key(state.eventId,'prizes'));
+        localStorage.removeItem(key(state.eventId,'winners'));
+      }catch(e){ STORAGE_OK=false; showError('저장소 삭제 실패 — 화면만 초기화됩니다.'); }
+      state.registrants=[]; state.checkins=[]; state.prizes={rank1:'1등 상품',rank2:'2등 상품',rank3:'3등 상품',rest:'참가상(4~10등)'}; state.winners=[];
+      renderAdmin(); renderDisplay();
+    };
+
+    // 당첨 카드
+    const wWrap = $('#winners'); wWrap.innerHTML='';
+    for(let rank=1; rank<=10; rank++){
+      const w = state.winners.find(x=>x.rank===rank);
+      const div = document.createElement('div'); div.className='card'; div.style.padding='12px';
+      div.innerHTML = w ? (`
+        <div class="muted small">${rank}등</div>
+        <div style="font-weight:800">#${w.code} ${escapeHtml(w.name||'')} <span class="muted small">(${maskEmp(w.empId)})</span></div>
+        <div class="muted small">상품: ${escapeHtml(prizeForRank(rank))}</div>
+      `) : (`
+        <div class="muted small">${rank}등</div>
+        <div class="muted">미정</div>
+      `);
+      wWrap.appendChild(div);
+    }
+  }
+
+  function startDraw(){
+    try{
+      // 항상 치유 후 진행 (undefined 섞여 발생하던 오류 방지)
+      state.registrants = healRegistrants(state.registrants);
+      state.checkins   = healCheckins(state.checkins);
+      state.winners    = healWinners(state.winners);
+
+      if(state.checkins.length<1){ alert('체크인 참가자가 없습니다.'); return; }
+      if(state.winners.length>=10){ alert('이미 10명 모두 당첨되었습니다. [결과 초기화] 후 다시 진행하세요.'); return; }
+
+      const already = new Set(state.winners.map(w=>normId(w.empId)));
+      const pool = state.checkins.filter(c=> c && normId(c.empId) && !already.has(normId(c.empId)));
+      if(pool.length<1){ alert('새로 추첨할 인원이 없습니다.'); return; }
+
+      const need = Math.min(10 - state.winners.length, pool.length);
+      shuffle(pool);
+      const picks = pool.slice(0, need);
+      const prizeList = rankPrizeList().slice(state.winners.length, state.winners.length + picks.length);
+
+      const now = Date.now();
+      const winners = picks.map((c,i)=>({ rank: state.winners.length+i+1, empId:c.empId, name:c.name, code:c.code, at: now+i, prize: prizeList[i] }));
+      state.winners = healWinners(state.winners.concat(winners)); // 최종 재정렬/검증
+
+      const ok = saveAll();
+      renderAdmin(); renderDisplay();
+      if(!ok) alert('저장 실패 — 화면에는 보이지만 새로고침 시 사라질 수 있습니다.');
+
+      // 컨페티 & 효과음 (선택적)
+      if(typeof fireConfetti==='function') fireConfetti();
+      if(typeof playFanfare==='function') playFanfare();
+    }catch(e){
+      console.error(e);
+      showError('추첨 중 오류: '+(e?.message||e));
+    }
+  }
+
+  // ===== 참가자 =====
+  function renderParticipant(){
+    const root = $('#participant');
+    if(state.tab!=='participant'){ root.innerHTML=''; return; }
+    $('#page').style.display='block';
+    root.innerHTML = `
+      <div class="card" style="max-width:560px;margin:0 auto">
+        <h3 style="margin:0 0 8px 0;font-size:18px;font-weight:800">사전신청자 확인</h3>
+        <p class="muted small">사번을 입력해 참여번호(4자리)를 발급받으세요. (중복 체크인 방지)</p>
+        <div class="row" style="gap:8px;margin:8px 0">
+          <input id="empInput" class="input mono grow" placeholder="사번 입력" />
+          <button id="checkBtn" class="btn pri">확인</button>
+        </div>
+        <div id="result"></div>
+      </div>`;
+    const submit = ()=>{
+      try{
+        const empIdRaw = $('#empInput').value.trim();
+        const k = normId(empIdRaw);
+        if(!k) return;
+        const result = $('#result');
+
+        const reg = state.registrants.find(r=> normId(r.empId)===k);
+        if(!reg){
+          result.innerHTML = `<div class="card" style="background:#fff1f2;border-color:#fecdd3"><div style="font-weight:700;color:#be123c">인증 실패</div><div class="muted small">사전신청 명단에 없습니다. 진행요원에게 문의하세요.</div></div>`;
+          return;
+        }
+        const exist = state.checkins.find(c=> normId(c.empId)===k);
+        if(exist){ result.innerHTML = successBox(exist.code, '이미 참여번호가 발급되어 있습니다.'); return; }
+
+        // 새 코드 생성 (0000~9999, 중복 회피)
+        const used = new Set(state.checkins.map(c=>c.code));
+        let code=''; let tries=0;
+        do{ code = String(Math.floor(Math.random()*10000)).padStart(4,'0'); tries++; }while(used.has(code)&&tries<20000);
+
+        const entry = { empId: reg.empId, name: reg.name, code, at: Date.now() };
+        state.checkins.push(entry);
+        state.checkins = healCheckins(state.checkins);
+        const ok = saveAll();
+
+        result.innerHTML = successBox(code, '참여번호가 발급되었습니다.');
+        renderAdmin();
+        if(!ok) alert('저장 실패 — 화면에는 보이지만 새로고침 시 사라질 수 있습니다.');
+      }catch(e){ showError('체크인 중 오류: '+(e?.message||e)); }
+    };
+    $('#checkBtn').onclick = submit;
+    $('#empInput').addEventListener('keydown', (e)=>{ if(e.key==='Enter') submit(); });
+  }
+
+  function successBox(code,msg){
+    return `<div class="card" style="background:#ecfdf5;border-color:#bbf7d0;text-align:center">
+      <div style="font-weight:700;color:#065f46">인증 성공</div>
+      <div class="muted small" style="margin-bottom:8px">${escapeHtml(msg)}</div>
+      <div class="muted small">당신의 참여번호</div>
+      <div class="big mono">${code}</div>
+      <div class="small muted" style="margin-top:6px">* 이 번호로 추첨에 참여합니다. 사번은 공개되지 않습니다.</div>
+    </div>`;
+  }
+
+  // ===== 발표 화면 =====
+  function renderDisplay(){
+    const root = $('#display');
+    if(state.tab!=='display'){ root.innerHTML=''; return; }
+    $('#page').style.display='block';
+
+    const boxes=[];
+    for(let rank=1; rank<=10; rank++){
+      const w = state.winners.find(x=>x.rank===rank);
+      boxes.push(`<div class="box">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px">
+          <div class="rank">${rank}등</div>
+          <div class="small muted">${escapeHtml(prizeForRank(rank))}</div>
+        </div>
+        <div class="center" style="padding:6px 0 4px 0">
+          ${w ? `<div><div class="big mono">#${w.code}</div><div class="name">${escapeHtml(w.name||'')}</div></div>` : `<div class="waiting">대기중…</div>`}
+        </div>
+      </div>`);
+    }
+    root.innerHTML = `<div class="display">
+      <div class="center" style="margin-bottom:12px">
+        <div style="font-size:22px;font-weight:800">추첨 결과</div>
+        <div class="small muted">(1~3등 개별상품, 4~10등 동일상품)</div>
+        <button id="enableSound" class="btn" style="margin-left:8px">🔊 사운드</button>
+      </div>
+      <div class="grid g2" style="gap:12px">${boxes.join('')}</div>
+      <div class="center small muted" style="margin-top:12px">발표 화면은 읽기 전용입니다. 추첨은 진행자 탭에서 시작하세요.</div>
+    </div>`;
+
+    const en=$('#enableSound'); if(en){ en.onclick=()=>{ try{ const AC=window.AudioContext||window.webkitAudioContext; if(AC){ if(!window._audioCtx) window._audioCtx=new AC(); if(window._audioCtx.state==='suspended') window._audioCtx.resume(); alert('사운드가 활성화되었습니다.'); } }catch{} }; }
+  }
+
+  // ===== 컨페티 & 효과음(옵션) =====
+  function fireConfetti(){
+    const duration = 1200;
+    const canvas = document.createElement('canvas');
+    canvas.style.position='fixed'; canvas.style.left=0; canvas.style.top=0; canvas.style.width='100%'; canvas.style.height='100%'; canvas.style.pointerEvents='none';
+    canvas.width=window.innerWidth; canvas.height=window.innerHeight; document.body.appendChild(canvas);
+    const ctx=canvas.getContext('2d'); const colors=['#f87171','#fbbf24','#34d399','#60a5fa','#a78bfa','#f472b6'];
+    const count=180; const parts=Array.from({length:count},()=>({x:Math.random()*canvas.width,y:-20-Math.random()*200,w:6+Math.random()*6,h:8+Math.random()*10,c:colors[Math|Math.random()*colors.length],vx:(Math.random()-0.5)*3,vy:2+Math.random()*4,a:Math.random()*Math.PI*2,spin:(Math.random()*0.2+0.05)*(Math.random()<0.5?-1:1)}));
+    let start; function frame(ts){ if(!start) start=ts; const t=ts-start; ctx.clearRect(0,0,canvas.width,canvas.height);
+      parts.forEach(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.05; p.a+=p.spin; ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.a); ctx.fillStyle=p.c; ctx.fillRect(-p.w/2,-p.h/2,p.w,p.h); ctx.restore(); });
+      if(t<duration) requestAnimationFrame(frame); else document.body.removeChild(canvas);
+    } requestAnimationFrame(frame);
+  }
+  function playFanfare(){
+    try{
+      const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
+      if(!window._audioCtx) window._audioCtx=new AC(); const ctx=window._audioCtx; const now=ctx.currentTime+0.05;
+      function tone(freq,t0,dur,type='triangle',gain=0.04){ const osc=ctx.createOscillator(); const g=ctx.createGain(); osc.type=type; osc.frequency.value=freq; g.gain.setValueAtTime(0.0001,now+t0); g.gain.exponentialRampToValueAtTime(gain,now+t0+0.02); g.gain.exponentialRampToValueAtTime(0.0001,now+t0+dur); osc.connect(g).connect(ctx.destination); osc.start(now+t0); osc.stop(now+t0+dur+0.05); }
+      [523.25,659.25,783.99,1046.5].forEach((f,i)=>tone(f,i*0.12,0.25));
+    }catch{}
+  }
+
+  // ===== 표 렌더 =====
+  function renderTable(headers, rows){
+    const thead = `<thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>`;
+    const tbody = `<tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${escapeHtml(String(c||''))}</td>`).join('')}</tr>`).join('')}</tbody>`;
+    return `<table>${thead}${tbody}</table>`;
+  }
+
+  function exportWinnersCSV(){
+    if(state.winners.length===0){ alert('내보낼 당첨 결과가 없습니다.'); return; }
+    const header = ['rank','code','empId','name','prize','at'];
+    const rows = state.winners.map(w=>[w.rank,w.code,w.empId,w.name||'',prizeForRank(w.rank), new Date(w.at).toISOString()]);
+    const csv = [header.join(','), ...rows.map(r=>r.join(','))].join('\n');
+    download(`${state.eventId||'event'}-winners.csv`, csv);
+  }
+
+  function parseCSV(text){
+    text = String(text||'').replace(/^\uFEFF/,'');
+    const lines = []; let cur='', inQ=false; let row=[];
+    for(let i=0;i<text.length;i++){
+      const ch=text[i], nx=text[i+1];
+      if(ch==='"'){ if(inQ && nx==='"'){ cur+='"'; i++; } else { inQ=!inQ; } continue; }
+      if(ch===',' && !inQ){ row.push(cur); cur=''; continue; }
+      if((ch==='\n'||ch==='\r') && !inQ){ if(ch==='\r' && nx==='\n'){ i++; } row.push(cur); lines.push(row); cur=''; row=[]; continue; }
+      cur+=ch;
+    }
+    if(cur.length>0 || row.length>0){ row.push(cur); lines.push(row); }
+    if(lines.length===0) return [];
+    // 헤더 검사
+    let start=0; let empIdx=0, nameIdx=1;
+    const head = lines[0].map(s=>String(s||'').trim().toLowerCase());
+    const empKeyIdx = head.findIndex(h=> h==='empid' || h==='사번');
+    const nameKeyIdx = head.findIndex(h=> h==='name' || h==='이름');
+    if(empKeyIdx !== -1 || nameKeyIdx !== -1){ start=1; if(empKeyIdx!==-1) empIdx=empKeyIdx; if(nameKeyIdx!==-1) nameIdx=nameKeyIdx; }
+    const out=[]; const seen=new Set();
+    for(let i=start;i<lines.length;i++){
+      const cols = lines[i]; if(!cols) continue;
+      const empId = String(cols[empIdx]||'').trim(); const name=String(cols[nameIdx]||'').trim();
+      const k=normId(empId); if(!k || seen.has(k)) continue; seen.add(k);
+      out.push({empId,name});
+    }
+    return out;
+  }
+
+  function maskEmp(emp){ if(!emp) return ''; const n=emp.length; if(n<=2) return '*'.repeat(n); return emp.slice(0,Math.ceil(n/2))+ '*'.repeat(n-Math.ceil(n/2)); }
+
+  // ===== 라우팅 =====
+  function initFromHash(){
+    const p = new URLSearchParams(location.hash.replace('#',''));
+    const event = p.get('event'); const tab = p.get('tab');
+    if(event){ state.eventId=event; loadAll(); $('#boot').innerHTML=''; $('#page').style.display='block'; }
+    if(tab){ state.tab=tab; }
+    if(!event){ showBootstrap(); } else { renderAll(); }
+  }
+  window.addEventListener('hashchange', initFromHash);
+
+  function renderAll(){ renderTop(); renderAdmin(); renderParticipant(); renderDisplay(); }
+
+  // 시작
+  initFromHash();
+  </script>
+
+  <!-- QR Code support (added) -->
+  <script src="https://unpkg.com/qrcode/build/qrcode.min.js"></script>
+  <script>
+  // Add a QR button next to the "링크 복사" button and render a QR for the participant link
+  (function(){
+    let qrInitialized = false;
+
+    function ensureQRButton(){
+      try{
+        const copyBtn = document.getElementById('copyLink');
+        const shareSpan = document.getElementById('shareLink');
+        if(!copyBtn || !shareSpan) return;
+
+        // Avoid duplicating the button on re-renders
+        if(document.getElementById('qrShowBtn')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'qrShowBtn';
+        btn.className = 'btn';
+        btn.style.marginLeft = '6px';
+        btn.textContent = 'QR 보기';
+
+        btn.onclick = function(){
+          try{
+            const url = (shareSpan.textContent || '').trim();
+            if(!url){ alert('참가자 링크가 없습니다. 이벤트를 먼저 생성하세요.'); return; }
+
+            // Create a container under the share line if not exists
+            let wrap = document.getElementById('qrWrap');
+            if(!wrap){
+              wrap = document.createElement('div');
+              wrap.id = 'qrWrap';
+              wrap.className = 'card';
+              wrap.style.marginTop = '8px';
+              wrap.innerHTML = '<div class="muted small">참가자 QR</div><div id="qrBox" style="padding-top:6px"></div>';
+              // place right after the copy button's parent (the share line)
+              const parent = copyBtn.parentElement || shareSpan.parentElement || document.body;
+              parent.parentElement.insertBefore(wrap, parent.nextSibling);
+            }
+            const box = document.getElementById('qrBox');
+            if(!box) return;
+
+            QRCode.toCanvas(url, { errorCorrectionLevel:'M', margin:1, width:200 }, function(err, canvas){
+              if(err){ alert(err); return; }
+              box.innerHTML='';
+              box.appendChild(canvas);
+            });
+          }catch(e){ alert('QR 생성 오류: '+ (e && e.message ? e.message : e)); }
+        };
+
+        // Insert the QR button next to copy button
+        copyBtn.parentElement.appendChild(btn);
+      }catch(e){ /* silent */ }
+    }
+
+    // Observe DOM changes so the button survives re-renders
+    const obs = new MutationObserver(()=> ensureQRButton());
+    obs.observe(document.documentElement, { childList:true, subtree:true });
+
+    // Also try shortly after load
+    window.addEventListener('load', function(){
+      setTimeout(ensureQRButton, 200);
+      setTimeout(ensureQRButton, 800);
+    });
+  })();
+  </script>
+  <!-- /QR Code support -->
+
+</body>
+</html>
